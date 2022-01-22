@@ -38,8 +38,6 @@ public:
           m_FormatDesc(nullptr),
           m_StreamView(nullptr),
           m_DisplayLink(nullptr),
-          m_LastAvColorSpace(AVCOL_SPC_UNSPECIFIED),
-          m_ColorSpace(nullptr),
           m_VsyncMutex(nullptr),
           m_VsyncPassed(nullptr)
     {
@@ -67,10 +65,6 @@ public:
 
         if (m_FormatDesc != nullptr) {
             CFRelease(m_FormatDesc);
-        }
-
-        if (m_ColorSpace != nullptr) {
-            CGColorSpaceRelease(m_ColorSpace);
         }
 
         for (int i = 0; i < Overlay::OverlayMax; i++) {
@@ -188,34 +182,11 @@ public:
         // these attachments for consistent behavior.
         CVBufferRemoveAttachment(pixBuf, kCVImageBufferPixelAspectRatioKey);
 
-        // Reset m_ColorSpace if the colorspace changes. This can happen when
-        // a game enters HDR mode (Rec 601 -> Rec 2020).
-        if (frame->colorspace != m_LastAvColorSpace) {
-            if (m_ColorSpace != nullptr) {
-                CGColorSpaceRelease(m_ColorSpace);
-                m_ColorSpace = nullptr;
-            }
-
-            switch (frame->colorspace) {
-            case AVCOL_SPC_BT709:
-                m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_709);
-                break;
-            case AVCOL_SPC_BT2020_NCL:
-                m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceITUR_2020);
-                break;
-            case AVCOL_SPC_SMPTE170M:
-                m_ColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-                break;
-            default:
-                break;
-            }
-
-            m_LastAvColorSpace = frame->colorspace;
-        }
-
-        if (m_ColorSpace != nullptr) {
-            CVBufferSetAttachment(pixBuf, kCVImageBufferCGColorSpaceKey, m_ColorSpace, kCVAttachmentMode_ShouldPropagate);
-        }
+        // HACK?: Setting kCVImageBufferCGColorSpaceKey appropriately seems to result in incorrect
+        // colors when being displayed in our AVSampleBufferDisplayLayer for Rec 601. VT will set
+        // a CGColorSpace by default, so we must remove it to get proper colors. It seems to make
+        // no difference either way for Rec 2020 content.
+        CVBufferRemoveAttachment(pixBuf, kCVImageBufferCGColorSpaceKey);
 
         // If the format has changed or doesn't exist yet, construct it with the
         // pixel buffer data
@@ -493,8 +464,6 @@ private:
     NSView* m_StreamView;
     NSTextField* m_OverlayTextFields[Overlay::OverlayMax];
     CVDisplayLinkRef m_DisplayLink;
-    AVColorSpace m_LastAvColorSpace;
-    CGColorSpaceRef m_ColorSpace;
     SDL_mutex* m_VsyncMutex;
     SDL_cond* m_VsyncPassed;
 };
