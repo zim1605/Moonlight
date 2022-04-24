@@ -208,6 +208,7 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps, bool enablePacing)
 {
     m_MaxVideoFps = maxVideoFps;
     m_DisplayFps = StreamUtils::getDisplayRefreshRate(window);
+    m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
 
     if (enablePacing) {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -259,22 +260,47 @@ void Pacer::renderFrame(AVFrame* frame)
     // Drop frames if we have too many queued up for a while
     m_FrameQueueLock.lock();
 
-    int frameDropTarget = 0;
-    for (int queueHistoryEntry : m_RenderQueueHistory) {
-        if (queueHistoryEntry == 0) {
-            // Be lenient as long as the queue length
-            // resolves before the end of frame history
-            frameDropTarget = 2;
-            break;
+    int frameDropTarget;
+
+    // Renderers that pace in lock-step with VBlank using waitToRender() without buffering any frames
+    // will get pacing logic that allows Pacer itself to smooth over network jitter rather than relying
+    // on the compositor or graphics pipeline to buffer a frame for us.
+    if ((m_RendererAttributes & (RENDERER_ATTRIBUTE_NO_BUFFERING | RENDERER_ATTRIBUTE_VBLANK_PACING)) == (RENDERER_ATTRIBUTE_NO_BUFFERING | RENDERER_ATTRIBUTE_VBLANK_PACING)) {
+        // Only weigh the pacing time if we've timed quite a few frames during this stats window.
+        // NB: This also covers the case where m_VideoStats can get zeroed out from under us.
+        int renderedFrames = m_VideoStats->renderedFrames;
+        if (renderedFrames <= m_MaxVideoFps / 3 || (m_VideoStats->totalPacerTime / renderedFrames) <= SDL_roundf(1000.0f / m_MaxVideoFps)) {
+            frameDropTarget = 1;
+        }
+        else {
+            frameDropTarget = 0;
         }
     }
-
-    // Keep a rolling 500 ms window of render queue history
-    if (m_RenderQueueHistory.count() == m_MaxVideoFps / 2) {
-        m_RenderQueueHistory.dequeue();
+    else if (m_RendererAttributes & RENDERER_ATTRIBUTE_NO_BUFFERING) {
+        // Renderers that don't buffer any frames but don't support waitToRender() need us to buffer
+        // an extra frame to ensure they don't starve while waiting to present.
+        frameDropTarget = 1;
     }
+    else {
+        SDL_assert(!(m_RendererAttributes & RENDERER_ATTRIBUTE_VBLANK_PACING));
 
-    m_RenderQueueHistory.enqueue(m_RenderQueue.count());
+        frameDropTarget = 0;
+        for (int queueHistoryEntry : m_RenderQueueHistory) {
+            if (queueHistoryEntry == 0) {
+                // Be lenient as long as the queue length
+                // resolves before the end of frame history
+                frameDropTarget = 2;
+                break;
+            }
+        }
+
+        // Keep a rolling 500 ms window of render queue history
+        if (m_RenderQueueHistory.count() == m_MaxVideoFps / 2) {
+            m_RenderQueueHistory.dequeue();
+        }
+
+        m_RenderQueueHistory.enqueue(m_RenderQueue.count());
+    }
 
     // Catch up if we're several frames ahead
     while (m_RenderQueue.count() > frameDropTarget) {

@@ -80,6 +80,7 @@ D3D11VARenderer::D3D11VARenderer()
       m_LastColorSpace(AVCOL_SPC_UNSPECIFIED),
       m_LastColorRange(AVCOL_RANGE_UNSPECIFIED),
       m_AllowTearing(false),
+      m_FrameWaitableObject(nullptr),
       m_VideoGenericPixelShader(nullptr),
       m_VideoBt601LimPixelShader(nullptr),
       m_VideoBt2020LimPixelShader(nullptr),
@@ -126,6 +127,11 @@ D3D11VARenderer::~D3D11VARenderer()
     SAFE_COM_RELEASE(m_OverlayPixelShader);
 
     SAFE_COM_RELEASE(m_RenderTargetView);
+
+    if (m_FrameWaitableObject != nullptr) {
+        CloseHandle(m_FrameWaitableObject);
+    }
+
     SAFE_COM_RELEASE(m_SwapChain);
 
     if (m_HwFramesContext != nullptr) {
@@ -340,6 +346,10 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
                          "GPU driver doesn't support DXGI_FEATURE_PRESENT_ALLOW_TEARING");
         }
     }
+    else {
+        // Use a waitable swapchain to minimize latency with vsync
+        swapChainDesc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
 
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
@@ -460,6 +470,22 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+    if (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+        SDL_assert(params->enableVsync);
+
+        // We only want one buffered frame on our waitable swapchain
+        hr = m_SwapChain->SetMaximumFrameLatency(1);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::SetMaximumFrameLatency() failed: %x",
+                         hr);
+            return false;
+        }
+
+        m_FrameWaitableObject = m_SwapChain->GetFrameLatencyWaitableObject();
+        SDL_assert(m_FrameWaitableObject != nullptr);
+    }
+
     return true;
 }
 
@@ -548,6 +574,21 @@ void D3D11VARenderer::setHdrMode(bool enabled)
     unlockContext(this);
 }
 
+void D3D11VARenderer::waitToRender()
+{
+    if (m_FrameWaitableObject != nullptr) {
+        SDL_assert(m_DecoderParams.enableVsync);
+
+        // Wait for the pipeline to be ready for the next frame in V-Sync mode.
+        //
+        // This callback happens before selecting the next frame to render, so
+        // we can wait for the previous frame to finish prior to picking the
+        // next one to display. This reduces the effective display latency
+        // by ensuring we always render the most recent frame immediately.
+        WaitForSingleObjectEx(m_FrameWaitableObject, 500, FALSE);
+    }
+}
+
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
     // Acquire the context lock for rendering to prevent concurrent
@@ -581,8 +622,8 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
     }
     else {
         // Otherwise, we'll submit as fast as possible and DWM will discard excess
-        // frames for us. If frame pacing is also enabled, our Vsync source will keep
-        // us in sync with VBlank.
+        // frames for us. We'll be synchronized by our waitable swapchain if vsync
+        // is enabled.
         flags = 0;
     }
 
@@ -993,8 +1034,19 @@ bool D3D11VARenderer::checkDecoderSupport(IDXGIAdapter* adapter)
 
 int D3D11VARenderer::getRendererAttributes()
 {
+    int attributes = 0;
+
     // This renderer supports HDR
-    return RENDERER_ATTRIBUTE_HDR_SUPPORT;
+    attributes |= RENDERER_ATTRIBUTE_HDR_SUPPORT;
+
+    // If we're using a waitable swapchain, this renderer buffers no frames
+    // in the graphics pipeline and synchronizes with VBlank using waitToRender().
+    // NB: These attributes will trigger special logic in Pacer.
+    if (m_FrameWaitableObject != nullptr) {
+        attributes |= RENDERER_ATTRIBUTE_NO_BUFFERING | RENDERER_ATTRIBUTE_VBLANK_PACING;
+    }
+
+    return attributes;
 }
 
 bool D3D11VARenderer::needsTestFrame()
