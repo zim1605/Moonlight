@@ -23,6 +23,7 @@ public:
     virtual void setHdrMode(bool enabled) override;
     virtual int getRendererAttributes() override;
     virtual bool needsTestFrame() override;
+    virtual bool isRenderThreadSupported() override;
 
 private:
     static void lockContext(void* lock_ctx);
@@ -47,6 +48,7 @@ private:
     int m_TextureAlignment;
     int m_DisplayWidth;
     int m_DisplayHeight;
+    bool m_Windowed;
     AVColorSpace m_LastColorSpace;
     AVColorRange m_LastColorRange;
 

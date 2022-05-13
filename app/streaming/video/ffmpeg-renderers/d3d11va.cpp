@@ -132,6 +132,12 @@ D3D11VARenderer::~D3D11VARenderer()
     SAFE_COM_RELEASE(m_OverlayPixelShader);
 
     SAFE_COM_RELEASE(m_RenderTargetView);
+
+    BOOL fullScreen;
+    if (m_SwapChain != nullptr && SUCCEEDED(m_SwapChain->GetFullscreenState(&fullScreen, nullptr)) && fullScreen) {
+        // It's illegal to destroy a full-screen swapchain. Make sure we're in windowed mode.
+        m_SwapChain->SetFullscreenState(FALSE, nullptr);
+    }
     SAFE_COM_RELEASE(m_SwapChain);
 
     if (m_HwFramesContext != nullptr) {
@@ -288,6 +294,8 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
         }
     }
 
+    m_Windowed = (SDL_GetWindowFlags(params->window) & SDL_WINDOW_FULLSCREEN_DESKTOP) != SDL_WINDOW_FULLSCREEN;
+
     DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
     swapChainDesc.Stereo = FALSE;
     swapChainDesc.SampleDesc.Count = 1;
@@ -331,7 +339,7 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
 
     // Use DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING with flip mode for non-vsync case, if possible.
     // NOTE: This is only possible in windowed or borderless windowed mode.
-    if (!params->enableVsync) {
+    if (!params->enableVsync && m_Windowed) {
         BOOL allowTearing = FALSE;
         hr = m_Factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
                                             &allowTearing,
@@ -354,14 +362,35 @@ bool D3D11VARenderer::initialize(PDECODER_PARAMETERS params)
             // Non-fatal
         }
     }
+    else if (params->enableVsync && !m_Windowed) {
+        IDXGIDevice1* dxgiDevice;
+
+        hr = m_Device->QueryInterface(__uuidof(IDXGIDevice1), (void **)&dxgiDevice);
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "ID3D11Device::QueryInterface(IDXGIDevice1) failed: %x",
+                         hr);
+            return false;
+        }
+
+        // Limit the number of pre-rendered frames when using v-sync in full-screen mode.
+        // In non-vsync or windowed scenarios, DWM will discard excess frames.
+        hr = dxgiDevice->SetMaximumFrameLatency(1);
+        dxgiDevice->Release();
+
+        if (FAILED(hr)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGIDevice1::SetMaximumFrameLatency() failed: %x",
+                         hr);
+            return false;
+        }
+    }
 
     SDL_SysWMinfo info;
     SDL_VERSION(&info.version);
     SDL_GetWindowWMInfo(params->window, &info);
     SDL_assert(info.subsystem == SDL_SYSWM_WINDOWS);
 
-    // Always use windowed or borderless windowed mode.. SDL does mode-setting for us in
-    // full-screen exclusive mode (SDL_WINDOW_FULLSCREEN), so this actually works out okay.
     IDXGISwapChain1* swapChain;
     hr = m_Factory->CreateSwapChainForHwnd(m_Device,
                                            info.info.win.window,
@@ -564,9 +593,82 @@ void D3D11VARenderer::setHdrMode(bool enabled)
 
 void D3D11VARenderer::renderFrame(AVFrame* frame)
 {
+    HRESULT hr;
+
     // Acquire the context lock for rendering to prevent concurrent
     // access from inside FFmpeg's decoding code
     lockContext(this);
+
+    // If we're not in full-screen but we're supposed to be, transition now.
+    // This may not be possible now (if occluded or lacking focus, for example), but we will continue
+    // to try before rendering each frame until we successfully switch to full-screen exclusive mode.
+    BOOL fullScreen = FALSE;
+    if (!m_Windowed && SUCCEEDED(m_SwapChain->GetFullscreenState(&fullScreen, nullptr)) && !fullScreen) {
+        hr = m_SwapChain->SetFullscreenState(TRUE, nullptr);
+        if (SUCCEEDED(hr)) {
+            // We have to release all explicit and implicit back buffer references before
+            // calling ResizeBuffers().
+            m_RenderTargetView->Release();
+            m_RenderTargetView = nullptr;
+
+            // NB: We do not pass DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH because SDL has already
+            // switched us to an appropriate mode for rendering.
+            hr = m_SwapChain->ResizeBuffers(0, m_DisplayWidth, m_DisplayHeight, DXGI_FORMAT_UNKNOWN, 0);
+            if (FAILED(hr)) {
+                SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                             "IDXGISwapChain::ResizeBuffers() failed: %x",
+                             hr);
+
+                unlockContext(this);
+
+                // Failure in ResizeBuffers() is fatal
+                SDL_Event event;
+                event.type = SDL_RENDER_TARGETS_RESET;
+                SDL_PushEvent(&event);
+                return;
+            }
+
+            // Create our render target view
+            {
+                ID3D11Resource* backBufferResource;
+                hr = m_SwapChain->GetBuffer(0, __uuidof(ID3D11Resource), (void**)&backBufferResource);
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "IDXGISwapChain::GetBuffer() failed: %x",
+                                 hr);
+
+                    unlockContext(this);
+
+                    // Failure in GetBuffer() is fatal
+                    SDL_Event event;
+                    event.type = SDL_RENDER_TARGETS_RESET;
+                    SDL_PushEvent(&event);
+                    return;
+                }
+
+                hr = m_Device->CreateRenderTargetView(backBufferResource, nullptr, &m_RenderTargetView);
+                backBufferResource->Release();
+                if (FAILED(hr)) {
+                    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                                 "ID3D11Device::CreateRenderTargetView() failed: %x",
+                                 hr);
+
+                    unlockContext(this);
+
+                    // Failure in CreateRenderTargetView() is fatal
+                    SDL_Event event;
+                    event.type = SDL_RENDER_TARGETS_RESET;
+                    SDL_PushEvent(&event);
+                    return;
+                }
+            }
+        }
+        else if (hr != DXGI_ERROR_NOT_CURRENTLY_AVAILABLE && hr != DXGI_STATUS_MODE_CHANGE_IN_PROGRESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "IDXGISwapChain::SetFullscreenState() failed: %x",
+                         hr);
+        }
+    }
 
     // Clear the back buffer
     const float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -584,6 +686,7 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
         renderOverlay((Overlay::OverlayType)i);
     }
 
+    UINT interval;
     UINT flags;
 
     if (m_AllowTearing) {
@@ -591,17 +694,35 @@ void D3D11VARenderer::renderFrame(AVFrame* frame)
 
         // If tearing is allowed, use DXGI_PRESENT_ALLOW_TEARING with syncInterval 0.
         // It is not valid to use any other syncInterval values in tearing mode.
+        interval = 0;
         flags = DXGI_PRESENT_ALLOW_TEARING;
+    }
+    else if (fullScreen && m_DecoderParams.enableVsync) {
+        // In full-screen mode, we won't have waitable swapchain.
+        // We'll use syncInterval 1 to synchronize with VBlank and pass
+        // DXGI_PRESENT_DO_NOT_WAIT for our flags to avoid blocking any
+        // concurrent decoding operations in flight.
+        interval = 1;
+        flags = DXGI_PRESENT_DO_NOT_WAIT;
     }
     else {
         // Otherwise, we'll submit as fast as possible and DWM will discard excess
         // frames for us. If frame pacing is also enabled or we're in full-screen,
         // our Vsync source will keep us in sync with VBlank.
+        interval = 0;
         flags = 0;
     }
 
     // Present according to the decoder parameters
-    HRESULT hr = m_SwapChain->Present(0, flags);
+    do {
+        hr = m_SwapChain->Present(interval, flags);
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+            // Unlock the context while we wait to try again
+            unlockContext(this);
+            SDL_Delay(1);
+            lockContext(this);
+        }
+    } while (hr == DXGI_ERROR_WAS_STILL_DRAWING);
 
     // Release the context lock
     unlockContext(this);
@@ -1012,13 +1133,6 @@ int D3D11VARenderer::getRendererAttributes()
     // This renderer supports HDR
     attributes |= RENDERER_ATTRIBUTE_HDR_SUPPORT;
 
-    // This renderer requires frame pacing to synchronize with VBlank when we're
-    // in full-screen. In windowed mode, we will render as fast we can and DWM
-    // will grab whatever is latest at the time unless the user opts for pacing.
-    if (SDL_GetWindowFlags(m_DecoderParams.window) & SDL_WINDOW_FULLSCREEN) {
-        attributes |= RENDERER_ATTRIBUTE_FORCE_PACING;
-    }
-
     return attributes;
 }
 
@@ -1029,6 +1143,19 @@ bool D3D11VARenderer::needsTestFrame()
     // horribly wrong and D3D11VideoDevice::CreateVideoDecoder() fails inside FFmpeg. We need to
     // catch that case before we commit to using D3D11VA.
     return true;
+}
+
+bool D3D11VARenderer::isRenderThreadSupported()
+{
+#if 0
+    // In windowed or borderless windowed modes, we can use the render thread.
+    // Full-screen exclusive to windowed transitions require us to receive
+    // WM_SIZE messages in the context of Present() which deadlocks on a separate
+    // render thread.
+    return m_Windowed;
+#else
+    return true;
+#endif
 }
 
 void D3D11VARenderer::lockContext(void *lock_ctx)
