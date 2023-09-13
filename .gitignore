@@ -5,3 +5,5 @@
 build/
 config.tests/*/.qmake.stash
 config.tests/*/Makefile
+
+.fake
